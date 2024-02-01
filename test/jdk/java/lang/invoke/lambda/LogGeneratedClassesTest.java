@@ -163,8 +163,11 @@ public class LogGeneratedClassesTest extends LUtils {
 
     @Test
     public void testDumpDirIsFile() throws IOException {
+        System.out.println("In testDumpDirIsFile");
         Path testDir = Path.of("notDir");
         Path dumpFile = testDir.resolve(DUMP_LAMBDA_PROXY_CLASS_FILES);
+        System.out.println("testDir: " + testDir.toAbsolutePath());
+        System.out.println("dumpFile: " + dumpFile.toAbsolutePath());
         Files.createDirectory(testDir);
         Files.createFile(dumpFile);
         assertTrue(Files.isRegularFile(dumpFile));
@@ -174,6 +177,9 @@ public class LogGeneratedClassesTest extends LUtils {
                                "-Djava.security.manager=allow",
                                "-Djdk.invoke.LambdaMetafactory.dumpProxyClassFiles",
                                "com.example.TestLambda");
+        System.out.println("START testDumpDirIsFile.tr.testOutput:");
+        tr.testOutput.forEach(System.out::println);
+        System.out.println("END testDumpDirIsFile.tr.testOutput");
         assertEquals(tr.testOutput.stream()
                                   .filter(s -> s.contains("DUMP_LAMBDA_PROXY_CLASS_FILES is not a directory"))
                                   .count(),
