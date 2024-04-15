@@ -25,7 +25,7 @@
 
 /*
  * ===========================================================================
- * (c) Copyright IBM Corp. 2022, 2023 All Rights Reserved
+ * (c) Copyright IBM Corp. 2022, 2024 All Rights Reserved
  * ===========================================================================
  */
 
@@ -58,9 +58,16 @@
 
 
 #include <assert.h>
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+#include <ctype.h>
+#include <sys/wait.h>
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
 
 #include "java.h"
 #include "jni.h"
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+#include "j9cfg.h"
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
 
 /*
  * A NOTE TO DEVELOPERS: For performance reasons it is important that
@@ -454,6 +461,194 @@ JLI_Launch(int argc, char ** argv,              /* main argc, argv */
         } \
     } while (JNI_FALSE)
 
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+static jboolean getCommandLineOptionValue(const char *optionName, int argc, char **argv, char **value) {
+    *value = NULL;
+    for (int i = 0; i < argc; i++) {
+        char *arg = argv[i];
+        if (0 == strncmp(arg, optionName, strlen(optionName))) {
+            char *equals = strchr(arg, '=');
+            if (NULL != equals) {
+                int length = strlen(equals + 1);
+                *value = (char *)JLI_MemAlloc(length + 1);
+                if (NULL == value) {
+                    JLI_ReportErrorMessage(
+                        "Failed to allocate memory for the value of the command line option %s.",
+                        optionName);
+                    exit(EXIT_FAILURE);
+                }
+                snprintf(*value, length + 1, "%s", equals + 1);
+                (*value)[length] = '\0';
+            }
+            return JNI_TRUE;
+        }
+    }
+    return JNI_FALSE;
+}
+
+static char *getCheckpointDir(int argc, char **argv) {
+    char *checkpointDir = NULL;
+    getCommandLineOptionValue("-XX:CRaCRestoreFrom", argc, argv, &checkpointDir);
+    return checkpointDir;
+}
+
+static char *getLogLevel(int argc, char **argv) {
+    char *defaultLogLevel = strdup("-v2");
+    const char *logLevelPropertyName = "-Dopenj9.internal.criu.logLevel";
+    char *logLevelPropertyValue = NULL;
+    if (NULL == defaultLogLevel) {
+        JLI_ReportErrorMessage("Failed to allocate memory for the CRIU default log level.");
+        exit(EXIT_FAILURE);
+    }
+    if (getCommandLineOptionValue(logLevelPropertyName, argc, argv, &logLevelPropertyValue)
+        && logLevelPropertyValue
+    ) {
+        for (const char *c = logLevelPropertyValue; *c; c++) {
+            if (!isdigit(*c)) {
+                JLI_ReportErrorMessage(
+                    "The value %s of the command line option %s is not valid.",
+                    logLevelPropertyValue,
+                    logLevelPropertyName);
+                JLI_MemFree(logLevelPropertyValue);
+                logLevelPropertyValue = NULL;
+                exit(EXIT_FAILURE);
+            }
+        }
+        int logLevelValue = atoi(logLevelPropertyValue);
+        if (logLevelValue >= 0 && logLevelValue <= 4) {
+            /* The format of the logLevel string is "-vX". */
+            char *logLevel = (char *)JLI_MemAlloc(4);
+            if (NULL == logLevel) {
+                JLI_MemFree(defaultLogLevel);
+                defaultLogLevel = NULL;
+                JLI_MemFree(logLevelPropertyValue);
+                logLevelPropertyValue = NULL;
+                exit(EXIT_FAILURE);
+            }
+            snprintf(logLevel, 4, "-v%d", logLevelValue);
+            JLI_MemFree(logLevelPropertyValue);
+            logLevelPropertyValue = NULL;
+            return logLevel;
+        }
+    }
+    if (logLevelPropertyValue) {
+        JLI_MemFree(logLevelPropertyValue);
+        logLevelPropertyValue = NULL;
+    }
+    return defaultLogLevel;
+}
+
+static char *getUnprivilegedMode(int argc, char **argv) {
+    const char *unprivilegedModePropertyName = "-Dopenj9.internal.criu.unprivilegedMode";
+    char *unprivilegedModePropertyValue = NULL;
+    if (getCommandLineOptionValue(unprivilegedModePropertyName, argc, argv, &unprivilegedModePropertyValue)) {
+            if (unprivilegedModePropertyValue) {
+                JLI_ReportErrorMessage(
+                    "The value %s of the command line option %s is not expected.",
+                    unprivilegedModePropertyValue,
+                    unprivilegedModePropertyName);
+                JLI_MemFree(unprivilegedModePropertyValue);
+                unprivilegedModePropertyValue = NULL;
+                exit(EXIT_FAILURE);
+            }
+            return strdup("--unprivileged");
+    }
+    return NULL;
+}
+
+static char *getLogFile(int argc, char **argv) {
+    char *logFilePropertyValue = NULL;
+    if (getCommandLineOptionValue("-Dopenj9.internal.criu.logFile", argc, argv, &logFilePropertyValue)
+        && logFilePropertyValue
+    ) {
+        int bufferSize = snprintf(NULL, 0, "--log-file=%s", logFilePropertyValue) + 1;
+        char *logFileOption = (char *)JLI_MemAlloc(bufferSize);
+        if (logFileOption == NULL) {
+            JLI_ReportErrorMessage("Failed to allocate memory for the CRIU log file option.");
+            exit(EXIT_FAILURE);
+        }
+        snprintf(logFileOption, bufferSize, "--log-file=%s", logFilePropertyValue);
+        JLI_MemFree(logFilePropertyValue);
+        logFilePropertyValue = NULL;
+        return logFileOption;
+    }
+    if (logFilePropertyValue) {
+        JLI_MemFree(logFilePropertyValue);
+        logFilePropertyValue = NULL;
+    }
+    return NULL;
+}
+
+static int restoreFromCheckpoint(char *checkpointDir, char *logLevel, char *unprivilegedMode, char *logFile) {
+    int argc = 6;
+    char *argv[9] = { NULL };
+    argv[0] = "criu";
+    argv[1] = "restore";
+    argv[2] = "-D";
+    argv[3] = checkpointDir;
+    argv[4] = logLevel;
+    argv[5] = "--shell-job";
+    if (unprivilegedMode) {
+        argv[argc++] = unprivilegedMode;
+    }
+    if (logFile) {
+        argv[argc++] = logFile;
+    }
+    argv[argc] = NULL;
+    if (-1 == execvp(argv[0], argv)) {
+        return -1;
+    }
+    return 0;
+}
+
+static void handleCRaCRestore(int argc, char **argv) {
+    char *checkpointDir = getCheckpointDir(argc, argv);
+    if (checkpointDir) {
+        /*
+         * The if block will be invoked by the child process,
+         * and the else block will be invoked by the parent process.
+         */
+        pid_t criuRestorePid = fork();
+        if (0 == criuRestorePid) {
+            char *logLevel = getLogLevel(argc, argv);
+            char *unprivilegedMode = getUnprivilegedMode(argc, argv);
+            char *logFile = getLogFile(argc, argv);
+            int restoreResult = restoreFromCheckpoint(checkpointDir, logLevel, unprivilegedMode, logFile);
+            if (NULL != logLevel) {
+                JLI_MemFree(logLevel);
+                logLevel = NULL;
+            }
+            if (NULL != unprivilegedMode) {
+                JLI_MemFree(unprivilegedMode);
+                unprivilegedMode = NULL;
+            }
+            if (NULL != logFile) {
+                JLI_MemFree(logFile);
+                logFile = NULL;
+            }
+            exit(restoreResult);
+        } else {
+            int exitStatus = EXIT_SUCCESS;
+            int criuRestorePidStatus = 0;
+            waitpid(criuRestorePid, &criuRestorePidStatus, 0);
+            if (WIFEXITED(criuRestorePidStatus)) {
+                if (0 != WEXITSTATUS(criuRestorePidStatus)) {
+                    JLI_ReportErrorMessage("Failed to restore from checkpoint.");
+                    exitStatus = EXIT_FAILURE;
+                }
+            } else {
+                JLI_ReportErrorMessage("The CRIU restore child process failed.");
+                exitStatus = EXIT_FAILURE;
+            }
+            if (NULL != checkpointDir) {
+                JLI_MemFree(checkpointDir);
+                checkpointDir = NULL;
+            }
+            exit(exitStatus);
+        }
+    }
+}
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
 
 int
 JavaMain(void* _args)
@@ -477,6 +672,10 @@ JavaMain(void* _args)
     jlong start = 0, end = 0;
 
     RegisterThread();
+
+#if defined(J9VM_OPT_CRAC_SUPPORT)
+    handleCRaCRestore(argc, argv);
+#endif /* defined(J9VM_OPT_CRAC_SUPPORT) */
 
     /* Initialize the virtual machine */
     start = CurrentTimeMicros();
